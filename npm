@@ -1,0 +1,480 @@
+#!/bin/bash
+
+#
+# npm compatibility wrapper around pnpm.
+#
+# Translates the npm commands that builds commonly run into their pnpm
+# equivalents, and configures pnpm to lay out node_modules like npm: a
+# flat (hoisted) node_modules and no packageManager field enforcement.
+# Any of these can be overridden by setting the matching pnpm_config_*
+# variable. pnpm's supply-chain protections (release age, dependency
+# build approval, exotic subdependency blocking) are deliberately left
+# to pnpm's defaults and the user's pnpm configuration.
+#
+
+set -eo pipefail
+
+die() {
+  echo "npm (pnpm-as-npm): $*" >&2
+  exit 1
+}
+
+warn() {
+  echo "npm (pnpm-as-npm): warning: $*" >&2
+}
+
+PNPM=${PNPM_AS_NPM_PNPM:-pnpm}
+command -v "$PNPM" > /dev/null ||
+  die 'pnpm not found in PATH (set PNPM_AS_NPM_PNPM to its location)'
+
+#
+# Config
+#
+# pnpm 11+ reads pnpm_config_*; older releases read npm_config_*
+#
+
+default_config() {
+  local MODERN=pnpm_config_$1 LEGACY=npm_config_$1
+  set_config "$1" "${!MODERN-${!LEGACY-$2}}"
+}
+
+set_config() {
+  export "pnpm_config_$1=$2" "npm_config_$1=$2"
+}
+
+default_config node_linker hoisted
+default_config pm_on_fail ignore
+default_config manage_package_manager_versions false
+default_config package_manager_strict false
+default_config update_notifier false
+
+use_npm_cache() {
+  [ -n "$pnpm_config_store_dir" ] || set_config store_dir "$1/pnpm/store"
+  [ -n "$pnpm_config_cache_dir" ] || set_config cache_dir "$1/pnpm/cache"
+}
+
+[ -n "$npm_config_cache" ] && use_npm_cache "$npm_config_cache"
+
+#
+# Arguments
+#
+# Parse options the way npm does: anywhere on the command line, up to "--".
+#
+
+LOCAL_PREFIX=
+LOGLEVEL=
+SELECTORS=()
+SAVE_FLAGS=()
+INSTALL_FLAGS=()
+OMIT_DEV=0
+OMIT_OPTIONAL=0
+INCLUDE_DEV=0
+INCLUDE_OPTIONAL=0
+IF_PRESENT=0
+EXEC_PACKAGES=()
+EXEC_CALL=
+EXEC_NO_INSTALL=0
+NO_SAVE=0
+SHOW_VERSION=0
+SHOW_HELP=0
+PASSTHROUGH=0
+FORWARD=()
+POSITIONAL=()
+REST=()
+
+is_passthrough() {
+  case $1 in
+    access|audit|bugs|issues|c|config|create|dedupe|ddp|deprecate|\
+    dist-tag|dist-tags|docs|home|explain|why|fund|get|set|info|show|view|\
+    v|init|link|ln|login|adduser|logout|ll|la|ls|list|outdated|owner|pack|\
+    ping|pkg|prune|publish|rebuild|rb|repo|search|s|se|find|star|stars|\
+    unstar|team|token|unpublish|whoami) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Sets $OPT_VALUE and $OPT_USED for an option that takes a value, given as
+# either "--opt=value" or "--opt value".
+take_value() {
+  if [[ "$1" == --*=* ]]; then
+    OPT_VALUE=${1#*=}
+    OPT_USED=1
+  else
+    (( $# >= 2 )) || die "Option $1 requires a value"
+    OPT_VALUE=$2
+    OPT_USED=2
+  fi
+}
+
+while (( $# )); do
+  OPT_USED=1
+  IS_COMMON=1
+  case $1 in
+    --)
+      shift
+      REST=("$@")
+      FORWARD+=(-- "$@")
+      break
+      ;;
+    --prefix|--prefix=*|-C)
+      take_value "$@"
+      LOCAL_PREFIX=$OPT_VALUE
+      ;;
+    -g|--global|--global=true) die 'Global mode is not supported' ;;
+    --location|--location=*)
+      take_value "$@"
+      [ "$OPT_VALUE" != global ] || die 'Global mode is not supported'
+      ;;
+    -s|--silent) LOGLEVEL=silent ;;
+    -q|--quiet) LOGLEVEL=warn ;;
+    -d|--verbose|-dd|-ddd) LOGLEVEL=debug ;;
+    --loglevel|--loglevel=*)
+      take_value "$@"
+      case $OPT_VALUE in
+        silent|error|warn|info) LOGLEVEL=$OPT_VALUE ;;
+        verbose|silly) LOGLEVEL=debug ;;
+      esac
+      ;;
+    -w|--workspace|--workspace=*)
+      take_value "$@"
+      SELECTORS+=(--filter "$OPT_VALUE")
+      ;;
+    -ws|--workspaces|--workspaces=true) SELECTORS+=(-r) ;;
+    --include-workspace-root|--include-workspace-root=true)
+      SELECTORS+=(--include-workspace-root)
+      ;;
+    --registry|--registry=*)
+      take_value "$@"
+      set_config registry "$OPT_VALUE"
+      ;;
+    --cache|--cache=*)
+      take_value "$@"
+      use_npm_cache "$OPT_VALUE"
+      ;;
+    *) IS_COMMON=0 ;;
+  esac
+  if [ $IS_COMMON -eq 1 ]; then
+    shift "$OPT_USED"
+    continue
+  elif [ $PASSTHROUGH -eq 1 ]; then
+    FORWARD+=("$1")
+    shift
+    continue
+  fi
+  case $1 in
+    -D|--save-dev|--save-dev=true) SAVE_FLAGS+=(-D) ;;
+    -P|--save-prod|--save-prod=true) SAVE_FLAGS+=(-P) ;;
+    -O|--save-optional|--save-optional=true) SAVE_FLAGS+=(-O) ;;
+    --save-peer|--save-peer=true) SAVE_FLAGS+=(--save-peer) ;;
+    -E|--save-exact|--save-exact=true) SAVE_FLAGS+=(-E) ;;
+    --no-save|--save=false) NO_SAVE=1 ;;
+    --production|--production=true|--only=prod|--only=production)
+      OMIT_DEV=1
+      ;;
+    --omit|--omit=*|--include|--include=*)
+      take_value "$@"
+      case ${1%%=*}:$OPT_VALUE in
+        --omit:dev) OMIT_DEV=1 ;;
+        --omit:optional) OMIT_OPTIONAL=1 ;;
+        --include:dev) INCLUDE_DEV=1 ;;
+        --include:optional) INCLUDE_OPTIONAL=1 ;;
+        *) die "Unsupported ${1%%=*} dependency type: $OPT_VALUE" ;;
+      esac
+      ;;
+    --no-optional|--optional=false) OMIT_OPTIONAL=1 ;;
+    --ignore-scripts|--ignore-scripts=true) INSTALL_FLAGS+=(--ignore-scripts) ;;
+    --offline|--offline=true) INSTALL_FLAGS+=(--offline) ;;
+    --prefer-offline|--prefer-offline=true) INSTALL_FLAGS+=(--prefer-offline) ;;
+    --package-lock-only|--package-lock-only=true) INSTALL_FLAGS+=(--lockfile-only) ;;
+    --no-package-lock|--package-lock=false) set_config lockfile false ;;
+    --if-present|--if-present=true) IF_PRESENT=1 ;;
+    --package|--package=*)
+      take_value "$@"
+      EXEC_PACKAGES+=("$OPT_VALUE")
+      ;;
+    -c|--call|--call=*)
+      take_value "$@"
+      EXEC_CALL=$OPT_VALUE
+      ;;
+    --no-install|--install=false|--no-yes|--yes=false) EXEC_NO_INSTALL=1 ;;
+    -y|--yes|--yes=true) ;;
+    -S|--save|--save=true|-f|--force|--force=true) ;;
+    --audit*|--no-audit|--fund*|--no-fund) ;;
+    --progress*|--no-progress|--update-notifier*|--no-update-notifier) ;;
+    --legacy-peer-deps*|--strict-peer-deps*|--foreground-scripts*) ;;
+    --unsafe-perm*|--install-links*|--install-strategy*) ;;
+    --bin-links*|--no-bin-links|--prefer-online*|--prefer-dedupe*) ;;
+    -v|--version) SHOW_VERSION=1 ;;
+    -h|--help|--usage|-\?) SHOW_HELP=1 ;;
+    --no-*)
+      # npm stores unknown options as config, which scripts see as
+      # npm_config_* variables
+      OPT_NAME=${1#--no-}
+      export "npm_config_${OPT_NAME//-/_}=false"
+      FORWARD+=("$1")
+      ;;
+    --*=*)
+      OPT_NAME=${1%%=*}
+      OPT_NAME=${OPT_NAME#--}
+      export "npm_config_${OPT_NAME//-/_}=${1#*=}"
+      FORWARD+=("$1")
+      ;;
+    --*)
+      OPT_NAME=${1#--}
+      export "npm_config_${OPT_NAME//-/_}=true"
+      FORWARD+=("$1")
+      ;;
+    -*)
+      FORWARD+=("$1")
+      ;;
+    *)
+      if (( ${#POSITIONAL[@]} == 0 )) && is_passthrough "$1"; then
+        PASSTHROUGH=1
+      fi
+      POSITIONAL+=("$1")
+      ;;
+  esac
+  shift "$OPT_USED"
+done
+
+if [ $INCLUDE_DEV -eq 1 ]; then
+  INSTALL_FLAGS+=(--prod=false)
+elif [ $OMIT_DEV -eq 1 ]; then
+  INSTALL_FLAGS+=(--prod)
+fi
+if [ $INCLUDE_OPTIONAL -eq 1 ]; then
+  INSTALL_FLAGS+=(--optional=true)
+elif [ $OMIT_OPTIONAL -eq 1 ]; then
+  INSTALL_FLAGS+=(--no-optional)
+fi
+
+if [ $SHOW_VERSION -eq 1 ]; then
+  POSITIONAL=(--version)
+elif [ $SHOW_HELP -eq 1 ]; then
+  POSITIONAL=(help "${POSITIONAL[@]:0:1}")
+fi
+(( ${#POSITIONAL[@]} )) || POSITIONAL=(help)
+NPM_CMD=${POSITIONAL[0]}
+CMD_ARGS=("${POSITIONAL[@]:1}" "${REST[@]}")
+
+PNPM_OPTS=()
+[ -n "$LOGLEVEL" ] && PNPM_OPTS+=("--loglevel=$LOGLEVEL")
+
+run_pnpm() {
+  "$PNPM" "${PNPM_OPTS[@]}" "$@"
+}
+
+#
+# Prefix
+#
+# npm's local prefix: the nearest directory containing package.json or
+# node_modules, or the current directory if there is none.
+#
+
+find_prefix() {
+  local DIR=$PWD
+  while [ "$DIR" != / ]; do
+    if [ -e "$DIR"/package.json ] || [ -d "$DIR"/node_modules ]; then
+      echo "$DIR"
+      return
+    fi
+    DIR=$(dirname "$DIR")
+  done
+  echo "$PWD"
+}
+
+if [ -n "$LOCAL_PREFIX" ]; then
+  LOCAL_PREFIX=$(realpath -m -- "$LOCAL_PREFIX")
+else
+  LOCAL_PREFIX=$(find_prefix)
+fi
+
+enter_prefix() {
+  { mkdir -p "$LOCAL_PREFIX" && cd "$LOCAL_PREFIX"; } ||
+    die "Cannot enter $LOCAL_PREFIX"
+}
+
+#
+# Lockfile
+#
+# An npm or yarn lockfile is imported into pnpm-lock.yaml, and its checksum
+# recorded, so that ci can tell an imported lockfile from one that was
+# written or edited by hand.
+#
+
+LOCK_STAMP=.pnpm-as-npm-lock.sha256
+
+has_npm_lockfile() {
+  [ -e package-lock.json ] || [ -e npm-shrinkwrap.json ] || [ -e yarn.lock ]
+}
+
+import_lockfile() {
+  if [ -e pnpm-lock.yaml ] || [ -L pnpm-lock.yaml ] || ! has_npm_lockfile; then
+    return
+  fi
+
+  # import resolves the full graph; dependency selection is for install
+  local OPTS=() FLAG
+  for FLAG in "${INSTALL_FLAGS[@]}"; do
+    case $FLAG in
+      --offline|--prefer-offline|--ignore-scripts) OPTS+=("--config.${FLAG#--}=true") ;;
+    esac
+  done
+  run_pnpm "${OPTS[@]}" import
+  [ -f pnpm-lock.yaml ] || die "import did not create pnpm-lock.yaml in $PWD"
+
+  local TMP
+  TMP=$(mktemp "$LOCK_STAMP".XXXXXX)
+  sha256sum pnpm-lock.yaml > "$TMP"
+  mv -fT "$TMP" "$LOCK_STAMP"
+}
+
+#
+# Commands
+#
+
+do_install() {
+  enter_prefix
+  import_lockfile
+  run_pnpm "${SELECTORS[@]}" install --no-frozen-lockfile "${INSTALL_FLAGS[@]}"
+}
+
+do_ci() {
+  enter_prefix
+
+  local SOURCES=() FILE
+  for FILE in package-lock.json npm-shrinkwrap.json yarn.lock; do
+    [ -e "$FILE" ] && SOURCES+=("$FILE")
+  done
+
+  if (( ${#SOURCES[@]} )); then
+    (( ${#SOURCES[@]} == 1 )) || die "ci cannot choose between: ${SOURCES[*]}"
+    if [ -e pnpm-lock.yaml ] || [ -L pnpm-lock.yaml ]; then
+      [[ -f pnpm-lock.yaml && ! -L pnpm-lock.yaml && -f "$LOCK_STAMP" &&
+        "$(< "$LOCK_STAMP")" == "$(sha256sum pnpm-lock.yaml)" ]] ||
+        die 'ci will not replace an unrecognized or edited pnpm-lock.yaml'
+      rm -f pnpm-lock.yaml
+    fi
+  else
+    [ -f pnpm-lock.yaml ] || die 'ci needs an existing lockfile'
+  fi
+
+  # pnpm import can reuse stale resolutions from inside node_modules
+  rm -rf node_modules
+  import_lockfile
+  run_pnpm "${SELECTORS[@]}" install --frozen-lockfile "${INSTALL_FLAGS[@]}"
+}
+
+run_script() {
+  local OPTS=()
+  [ $IF_PRESENT -eq 1 ] && OPTS+=(--if-present)
+  enter_prefix
+  run_pnpm "${SELECTORS[@]}" run "${OPTS[@]}" "$@"
+}
+
+do_exec() {
+  local BIN=$LOCAL_PREFIX/node_modules/.bin
+
+  if (( ${#EXEC_PACKAGES[@]} )); then
+    [ $EXEC_NO_INSTALL -eq 0 ] || die 'exec --no-install cannot fetch --package'
+
+    local DLX=() PKG
+    for PKG in "${EXEC_PACKAGES[@]}"; do
+      DLX+=("--package=$PKG")
+    done
+
+    if [ -n "$EXEC_CALL" ]; then
+      exec "$PNPM" "${PNPM_OPTS[@]}" "${DLX[@]}" dlx sh -c "$EXEC_CALL"
+    fi
+    if (( ${#CMD_ARGS[@]} )); then
+      exec "$PNPM" "${PNPM_OPTS[@]}" "${DLX[@]}" dlx "${CMD_ARGS[@]}"
+    fi
+    exec "$PNPM" "${PNPM_OPTS[@]}" dlx "${EXEC_PACKAGES[0]}"
+  fi
+
+  if [ -n "$EXEC_CALL" ]; then
+    PATH=$BIN:$PATH exec sh -c "$EXEC_CALL"
+  fi
+  (( ${#CMD_ARGS[@]} )) || die 'exec needs a command to run'
+  if [ -x "$BIN/${CMD_ARGS[0]}" ]; then
+    PATH=$BIN:$PATH exec "${CMD_ARGS[@]}"
+  fi
+  [ $EXEC_NO_INSTALL -eq 0 ] || die "${CMD_ARGS[0]} is not installed in $LOCAL_PREFIX"
+  exec "$PNPM" "${PNPM_OPTS[@]}" dlx "${CMD_ARGS[@]}"
+}
+
+case $NPM_CMD in
+  --version)
+    run_pnpm --version
+    ;;
+  install|i|in|ins|inst|insta|instal|isnt|isnta|isntal|isntall|add)
+    if (( ${#CMD_ARGS[@]} )); then
+      [ $NO_SAVE -eq 1 ] && warn '--no-save is not supported; saving to package.json'
+      enter_prefix
+      import_lockfile
+      run_pnpm "${SELECTORS[@]}" add "${SAVE_FLAGS[@]}" \
+        "${INSTALL_FLAGS[@]}" "${CMD_ARGS[@]}"
+    else
+      do_install
+    fi
+    ;;
+  ci|clean-install|ic|install-clean|isntall-clean)
+    do_ci
+    ;;
+  install-test|it)
+    do_install
+    run_script test "${CMD_ARGS[@]}"
+    ;;
+  install-ci-test|cit)
+    do_ci
+    run_script test "${CMD_ARGS[@]}"
+    ;;
+  uninstall|unlink|remove|rm|r|un)
+    enter_prefix
+    run_pnpm "${SELECTORS[@]}" remove "${CMD_ARGS[@]}"
+    ;;
+  update|up|upgrade|udpate)
+    enter_prefix
+    import_lockfile
+    run_pnpm "${SELECTORS[@]}" update "${CMD_ARGS[@]}"
+    ;;
+  run|run-script|rum|urn)
+    run_script "${CMD_ARGS[@]}"
+    ;;
+  test|tst|t)
+    run_script test "${CMD_ARGS[@]}"
+    ;;
+  start|stop|restart)
+    enter_prefix
+    run_pnpm "${SELECTORS[@]}" "$NPM_CMD" "${CMD_ARGS[@]}"
+    ;;
+  exec|x)
+    do_exec
+    ;;
+  prefix)
+    echo "$LOCAL_PREFIX"
+    ;;
+  root|bin)
+    enter_prefix
+    run_pnpm "$NPM_CMD"
+    ;;
+  cache)
+    case ${CMD_ARGS[0]} in
+      clean|clear|rm) run_pnpm store prune ;;
+      verify) run_pnpm store status ;;
+      *) die "cache ${CMD_ARGS[0]} is not supported" ;;
+    esac
+    ;;
+  help)
+    run_pnpm help "${CMD_ARGS[@]}"
+    ;;
+  version)
+    (( ${#CMD_ARGS[@]} )) || exec "$PNPM" --version
+    die "version ${CMD_ARGS[0]} is not supported"
+    ;;
+  *)
+    [ $PASSTHROUGH -eq 1 ] || die "Unsupported command: $NPM_CMD"
+    enter_prefix
+    run_pnpm "${SELECTORS[@]}" "$NPM_CMD" "${FORWARD[@]}"
+    ;;
+esac
