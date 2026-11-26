@@ -19,6 +19,18 @@ export PATH="$HOME/.local/bin:$PATH"
 To keep that `PATH` order in new shells, add the `export` line to your
 shell startup file.
 
+### Arch Linux package
+
+The package installs the wrappers in `/usr/lib/pnpm-as-npm/bin` and adds
+that directory to `PATH` with `/etc/makepkg.conf.d/pnpm-as-npm.conf`, so
+they're used only while makepkg builds a package. If an AUR helper doesn't
+pick up the drop-in, load makepkg's configuration in a wrapper script
+before running the helper:
+
+```sh
+source /usr/share/makepkg/util/config.sh && load_makepkg_config
+```
+
 ## Configuration
 
 | Variable           | Effect                                                  |
